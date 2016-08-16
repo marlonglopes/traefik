@@ -5,18 +5,22 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/containous/staert"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
 	"github.com/docker/libkv/store/consul"
 	"github.com/go-check/check"
+	"golang.org/x/net/context"
 
 	"errors"
+	"github.com/containous/traefik/cluster"
 	"github.com/containous/traefik/integration/utils"
 	"github.com/containous/traefik/provider"
 	checker "github.com/vdemeester/shakers"
 	"io/ioutil"
 	"os"
 	"strings"
+	"sync"
 )
 
 // Consul test suites (using libcompose)
@@ -426,4 +430,85 @@ func (s *ConsulSuite) TestCommandStoreConfig(c *check.C) {
 		c.Assert(string(p.Value), checker.Equals, value)
 
 	}
+}
+
+type TestStruct struct {
+	String string
+	Int    int
+}
+
+func (s *ConsulSuite) TestDatastore(c *check.C) {
+	s.setupConsul(c)
+	consulHost := s.composeProject.Container(c, "consul").NetworkSettings.IPAddress
+	kvSource, err := staert.NewKvSource(store.CONSUL, []string{consulHost}, &store.Config{
+		ConnectionTimeout: 10 * time.Second,
+	}, "traefik")
+	c.Assert(err, checker.IsNil)
+
+	ctx := context.Background()
+	datastore1, err := cluster.NewDataStore(kvSource, ctx, "lock", &TestStruct{})
+	c.Assert(err, checker.IsNil)
+	datastore2, err := cluster.NewDataStore(kvSource, ctx, "lock", &TestStruct{})
+	c.Assert(err, checker.IsNil)
+	err = datastore1.Put(&TestStruct{
+		String: "foo",
+		Int:    1,
+	})
+	c.Assert(err, checker.IsNil)
+	time.Sleep(2 * time.Second)
+	test1 := datastore1.Get().(*TestStruct)
+	c.Assert(test1.String, checker.Equals, "foo")
+
+	test2 := datastore2.Get().(*TestStruct)
+	c.Assert(test2.String, checker.Equals, "foo")
+
+	err = datastore2.Put(&TestStruct{
+		String: "bar",
+		Int:    19200,
+	})
+	c.Assert(err, checker.IsNil)
+	time.Sleep(2 * time.Second)
+	test1 = datastore1.Get().(*TestStruct)
+	c.Assert(test1.String, checker.Equals, "bar")
+
+	test2 = datastore2.Get().(*TestStruct)
+	c.Assert(test2.String, checker.Equals, "bar")
+
+	wg := &sync.WaitGroup{}
+	wg.Add(4)
+	go func() {
+		for i := 0; i < 100; i++ {
+			err = datastore1.Put(&TestStruct{
+				String: "datastore1",
+				Int:    i,
+			})
+			c.Assert(err, checker.IsNil)
+		}
+		wg.Done()
+	}()
+	go func() {
+		for i := 0; i < 100; i++ {
+			err = datastore2.Put(&TestStruct{
+				String: "datastore2",
+				Int:    i,
+			})
+			c.Assert(err, checker.IsNil)
+		}
+		wg.Done()
+	}()
+	go func() {
+		for i := 0; i < 100; i++ {
+			test1 := datastore1.Get().(*TestStruct)
+			c.Assert(test1, checker.NotNil)
+		}
+		wg.Done()
+	}()
+	go func() {
+		for i := 0; i < 100; i++ {
+			test2 := datastore2.Get().(*TestStruct)
+			c.Assert(test2, checker.NotNil)
+		}
+		wg.Done()
+	}()
+	wg.Wait()
 }
